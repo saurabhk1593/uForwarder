@@ -289,3 +289,4 @@ public final class RebalancingJobGroup {
     return rebalancingJobGroup -> states.contains(rebalancingJobGroup.getJobGroupState());
   }
 }
+

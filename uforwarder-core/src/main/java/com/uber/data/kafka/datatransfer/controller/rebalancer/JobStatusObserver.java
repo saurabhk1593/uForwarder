@@ -25,3 +25,5 @@ public interface JobStatusObserver {
    */
   void onStatusUpdate(RebalancingJobGroup group, long jobId, KafkaConsumerTaskStatus taskStatus);
 }
+
+

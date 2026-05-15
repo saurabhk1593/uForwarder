@@ -4,11 +4,14 @@ import com.google.common.collect.ImmutableMap;
 import com.google.common.collect.ImmutableSet;
 import com.uber.data.kafka.datatransfer.FlowControl;
 import com.uber.data.kafka.datatransfer.JobState;
+import com.uber.data.kafka.datatransfer.KafkaConsumerTaskStatus;
 import com.uber.data.kafka.datatransfer.ScaleStatus;
 import com.uber.data.kafka.datatransfer.StoredJob;
 import com.uber.data.kafka.datatransfer.StoredJobGroup;
 import com.uber.data.kafka.datatransfer.StoredJobStatus;
 import com.uber.data.kafka.datatransfer.controller.autoscalar.Throughput;
+import java.util.ArrayList;
+import java.util.List;
 import org.apache.curator.x.async.modeled.versioned.Versioned;
 import org.junit.jupiter.api.Assertions;
 import org.junit.jupiter.api.BeforeEach;
@@ -119,5 +122,91 @@ public class RebalancingJobGroupTest {
     Assertions.assertTrue(rebalancingJobGroup.isChanged());
     Assertions.assertEquals(
         3.0, rebalancingJobGroup.toStoredJobGroup().model().getScaleStatus().getScale(), 0.001);
+  }
+
+  // ── Observer tests ────────────────────────────────────────────────────────
+
+  @Test
+  public void testUpdateJobStatus_notifiesRegisteredObserver() {
+    List<Long> capturedJobIds = new ArrayList<>();
+    JobStatusObserver observer =
+        (group, jobId, taskStatus) -> capturedJobIds.add(jobId);
+
+    rebalancingJobGroup.addObserver(observer);
+    KafkaConsumerTaskStatus status =
+        KafkaConsumerTaskStatus.newBuilder().setCommitOffset(10).setBrokerEndOffset(100).build();
+    rebalancingJobGroup.updateJobStatus(1L, status);
+
+    Assertions.assertEquals(1, capturedJobIds.size());
+    Assertions.assertEquals(1L, capturedJobIds.get(0).longValue());
+  }
+
+  @Test
+  public void testUpdateJobStatus_passesCorrectArgsToObserver() {
+    List<KafkaConsumerTaskStatus> capturedStatuses = new ArrayList<>();
+    List<RebalancingJobGroup> capturedGroups = new ArrayList<>();
+    JobStatusObserver observer =
+        (group, jobId, taskStatus) -> {
+          capturedGroups.add(group);
+          capturedStatuses.add(taskStatus);
+        };
+
+    KafkaConsumerTaskStatus status =
+        KafkaConsumerTaskStatus.newBuilder().setCommitOffset(50).setBrokerEndOffset(200).build();
+    rebalancingJobGroup.addObserver(observer);
+    rebalancingJobGroup.updateJobStatus(2L, status);
+
+    Assertions.assertSame(rebalancingJobGroup, capturedGroups.get(0));
+    Assertions.assertEquals(status, capturedStatuses.get(0));
+  }
+
+  @Test
+  public void testUpdateJobStatus_doesNotSetChanged() {
+    rebalancingJobGroup.addObserver((group, jobId, taskStatus) -> {});
+    KafkaConsumerTaskStatus status = KafkaConsumerTaskStatus.newBuilder().build();
+
+    rebalancingJobGroup.updateJobStatus(1L, status);
+
+    // updateJobStatus is a notification-only call; it must not mark the group dirty
+    // so that the controller does not write it back to the store unnecessarily.
+    Assertions.assertFalse(rebalancingJobGroup.isChanged());
+  }
+
+  @Test
+  public void testUpdateJobStatus_noObservers_doesNotThrow() {
+    KafkaConsumerTaskStatus status = KafkaConsumerTaskStatus.newBuilder().build();
+    // should be a no-op without throwing
+    Assertions.assertDoesNotThrow(() -> rebalancingJobGroup.updateJobStatus(1L, status));
+  }
+
+  @Test
+  public void testUpdateJobStatus_notifiesAllRegisteredObservers() {
+    List<Integer> calls = new ArrayList<>();
+    rebalancingJobGroup.addObserver((group, jobId, taskStatus) -> calls.add(1));
+    rebalancingJobGroup.addObserver((group, jobId, taskStatus) -> calls.add(2));
+    rebalancingJobGroup.addObserver((group, jobId, taskStatus) -> calls.add(3));
+
+    rebalancingJobGroup.updateJobStatus(1L, KafkaConsumerTaskStatus.newBuilder().build());
+
+    Assertions.assertEquals(3, calls.size());
+  }
+
+  @Test
+  public void testRemoveObserver_stopsNotification() {
+    List<Long> capturedJobIds = new ArrayList<>();
+    JobStatusObserver observer = (group, jobId, taskStatus) -> capturedJobIds.add(jobId);
+
+    rebalancingJobGroup.addObserver(observer);
+    rebalancingJobGroup.removeObserver(observer);
+    rebalancingJobGroup.updateJobStatus(1L, KafkaConsumerTaskStatus.newBuilder().build());
+
+    Assertions.assertTrue(capturedJobIds.isEmpty());
+  }
+
+  @Test
+  public void testRemoveObserver_nonRegistered_doesNotThrow() {
+    JobStatusObserver observer = (group, jobId, taskStatus) -> {};
+    // removing an observer that was never added should be a safe no-op
+    Assertions.assertDoesNotThrow(() -> rebalancingJobGroup.removeObserver(observer));
   }
 }
