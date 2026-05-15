@@ -48,6 +48,10 @@ message KafkaConsumerTaskStatus {
   int64 total_bytes_inflight = 8;
   // computed cpu usage, in terms of percentage per core
   double cpu_usage = 9;
+  // latest offset available on the broker (log end offset).
+  // Used by the controller to compute consumer lag per partition:
+  //   lag = broker_end_offset - commit_offset
+  int64 broker_end_offset = 10;
 }
 
 // KafkaDispatcherTaskStatus represents the state of the dispatcher task.

@@ -160,6 +160,46 @@ public final class RebalancingJobGroup {
   }
 
   /**
+   * Adds a new {@link StoredJob} to this job group.
+   *
+   * <p>Used by {@link LagMitigationRebalancer} to inject:
+   *
+   * <ul>
+   *   <li>A replacement main job (after the old one is removed) that seeks to the latest offset.
+   *   <li>A bounded catch-up job that replays the lagging offset range.
+   * </ul>
+   *
+   * @return true if the job was added; false if a job with the same job ID already exists.
+   */
+  public synchronized boolean addJob(StoredJob job) {
+    long jobId = job.getJob().getJobId();
+    if (jobsMap.containsKey(jobId)) {
+      return false;
+    }
+    jobsMap.put(jobId, job);
+    changed.set(true);
+    return true;
+  }
+
+  /**
+   * Removes an existing {@link StoredJob} from this job group by job ID.
+   *
+   * <p>Used by {@link LagMitigationRebalancer} to evict the lagging main job before replacing it
+   * with an updated version that seeks to the latest offset.
+   *
+   * @param jobId the ID of the job to remove
+   * @return the removed job, or empty if no job with that ID was present
+   */
+  public synchronized java.util.Optional<StoredJob> removeJob(long jobId) {
+    StoredJob removed = jobsMap.remove(jobId);
+    if (removed != null) {
+      changed.set(true);
+      return java.util.Optional.of(removed);
+    }
+    return java.util.Optional.empty();
+  }
+
+  /**
    * Updates the Job Group State.
    *
    * @return true if update was successful and value was changed, otherwise false.

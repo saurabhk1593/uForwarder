@@ -87,6 +87,12 @@ public abstract class AbstractKafkaFetcherThread<K, V> extends ShutdownableThrea
   // After each refreshPartitionMap(), previousJobRunningMap will be changed to the jobRunningMap.
   final ConcurrentMap<Long, Job> currentRunningJobMap = new ConcurrentHashMap<>();
 
+  // Cache of the latest broker end offset per topic-partition, refreshed periodically in
+  // logTopicPartitionOffsetInfo() and populated eagerly in seekStartOffset().
+  // Used to compute consumer lag and reported in KafkaConsumerTaskStatus.broker_end_offset.
+  private final ConcurrentMap<TopicPartition, Long> brokerEndOffsetCache =
+      new ConcurrentHashMap<>();
+
   // a scheduled executor service for reporting metric
   private final ScheduledExecutorService scheduledExecutorService;
 
@@ -790,6 +796,9 @@ public abstract class AbstractKafkaFetcherThread<K, V> extends ShutdownableThrea
     Map<TopicPartition, Long> beginningOffsets =
         kafkaConsumer.beginningOffsets(seekOffsetTaskMap.keySet());
     Map<TopicPartition, Long> endOffsets = kafkaConsumer.endOffsets(seekOffsetTaskMap.keySet());
+    // Eagerly seed the broker end offset cache for newly-assigned partitions so that lag is
+    // visible in the status before the periodic refresh in logTopicPartitionOffsetInfo().
+    brokerEndOffsetCache.putAll(endOffsets);
     for (Map.Entry<TopicPartition, Long> entry : seekOffsetTaskMap.entrySet()) {
       TopicPartition tp = entry.getKey();
       long offset = entry.getValue();
@@ -1000,6 +1009,11 @@ public abstract class AbstractKafkaFetcherThread<K, V> extends ShutdownableThrea
           jobStatusBuilder.setState(JobState.JOB_STATE_RUNNING);
           CheckpointInfo checkpointInfo = checkpointManager.getCheckpointInfo(job);
           ThroughputTracker.Throughput throughput = throughputTracker.getThroughput(job);
+          TopicPartition tp =
+              new TopicPartition(
+                  job.getKafkaConsumerTask().getTopic(),
+                  job.getKafkaConsumerTask().getPartition());
+          long brokerEndOffset = brokerEndOffsetCache.getOrDefault(tp, -1L);
           KafkaConsumerTaskStatus kafkaConsumerTaskStatus =
               KafkaConsumerTaskStatus.newBuilder()
                   .setReadOffset(checkpointInfo.getFetchOffset())
@@ -1007,6 +1021,7 @@ public abstract class AbstractKafkaFetcherThread<K, V> extends ShutdownableThrea
                   .setMessagesPerSec(throughput.messagePerSec)
                   .setBytesPerSec(throughput.bytesPerSec)
                   .setCpuUsage(cpuUsagePerJob)
+                  .setBrokerEndOffset(brokerEndOffset)
                   .build();
           jobStatusBuilder.setKafkaConsumerTaskStatus(kafkaConsumerTaskStatus);
           builder.add(jobStatusBuilder.build());
@@ -1212,6 +1227,40 @@ public abstract class AbstractKafkaFetcherThread<K, V> extends ShutdownableThrea
     LOGGER.debug(
         "fetching from Kafka",
         StructuredLogging.topicPartitionOffsets(topicPartitionOffsetMap.build()));
+
+    // Refresh broker end offsets for all currently assigned partitions so that
+    // KafkaConsumerTaskStatus.broker_end_offset stays up-to-date between partition assignments.
+    if (!taskMap.isEmpty()) {
+      try {
+        Map<TopicPartition, Long> refreshedEndOffsets =
+            kafkaConsumer.endOffsets(taskMap.keySet());
+        brokerEndOffsetCache.putAll(refreshedEndOffsets);
+
+        // Emit consumer lag gauge per partition: lag = brokerEndOffset - committedOffset.
+        refreshedEndOffsets.forEach(
+            (tp, endOffset) -> {
+              Job job = taskMap.get(tp);
+              if (job == null || endOffset < 0) {
+                return;
+              }
+              long committedOffset =
+                  checkpointManager.getCheckpointInfo(job).getCommittedOffset();
+              long lag = (committedOffset >= 0) ? Math.max(0, endOffset - committedOffset) : 0;
+              scope
+                  .tagged(
+                      StructuredTags.builder()
+                          .setKafkaGroup(job.getKafkaConsumerTask().getConsumerGroup())
+                          .setKafkaTopic(tp.topic())
+                          .setKafkaPartition(tp.partition())
+                          .build())
+                  .gauge(MetricNames.CONSUMER_LAG)
+                  .update(lag);
+            });
+      } catch (Exception e) {
+        LOGGER.warn("failed to refresh broker end offsets for lag monitoring", e);
+      }
+    }
+
     reportKafkaConsumerMetrics();
     lastDumpTime = System.currentTimeMillis();
   }
@@ -1342,5 +1391,8 @@ public abstract class AbstractKafkaFetcherThread<K, V> extends ShutdownableThrea
     static final String OFFSET = "fetcher.kafka.offset";
     static final String OFFSET_COMMIT_SUCCESS = "fetcher.kafka.offset.commit.success";
     static final String OFFSET_COMMIT_FAILURE = "fetcher.kafka.offset.commit.failure";
+    // Consumer lag: brokerEndOffset - committedOffset, emitted per partition on each offset monitor
+    // interval. A value > 0 indicates the consumer is behind the broker.
+    static final String CONSUMER_LAG = "fetcher.kafka.consumer.lag";
   }
 }
