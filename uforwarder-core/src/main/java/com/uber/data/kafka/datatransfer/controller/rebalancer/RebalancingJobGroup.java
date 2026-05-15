@@ -2,6 +2,7 @@ package com.uber.data.kafka.datatransfer.controller.rebalancer;
 
 import com.uber.data.kafka.datatransfer.JobGroup;
 import com.uber.data.kafka.datatransfer.JobState;
+import com.uber.data.kafka.datatransfer.KafkaConsumerTaskStatus;
 import com.uber.data.kafka.datatransfer.ScaleStatus;
 import com.uber.data.kafka.datatransfer.StoredJob;
 import com.uber.data.kafka.datatransfer.StoredJobGroup;
@@ -9,10 +10,12 @@ import com.uber.data.kafka.datatransfer.StoredJobStatus;
 import com.uber.data.kafka.datatransfer.common.StructuredLogging;
 import com.uber.data.kafka.datatransfer.controller.autoscalar.Throughput;
 import java.util.Collections;
+import java.util.List;
 import java.util.Map;
 import java.util.Optional;
 import java.util.Set;
 import java.util.concurrent.ConcurrentMap;
+import java.util.concurrent.CopyOnWriteArrayList;
 import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.function.Predicate;
 import java.util.stream.Collectors;
@@ -31,6 +34,7 @@ public final class RebalancingJobGroup {
   private final Map<Long, StoredJobStatus> jobStatusMap;
   private final int version;
   private AtomicBoolean changed;
+  private final List<JobStatusObserver> observers = new CopyOnWriteArrayList<>();
 
   private RebalancingJobGroup(
       StoredJobGroup storedJobGroup,
@@ -120,6 +124,33 @@ public final class RebalancingJobGroup {
    */
   public synchronized Map<Long, StoredJobStatus> getJobStatusMap() {
     return jobStatusMap;
+  }
+
+  /** Registers an observer to be notified on {@link #updateJobStatus} calls. */
+  public void addObserver(JobStatusObserver observer) {
+    observers.add(observer);
+  }
+
+  /** Removes a previously registered observer. No-op if the observer was not registered. */
+  public void removeObserver(JobStatusObserver observer) {
+    observers.remove(observer);
+  }
+
+  /**
+   * Notifies all registered {@link JobStatusObserver}s that the given job's status has been
+   * evaluated. This does not modify the stored job-status snapshot; it is purely a notification
+   * hook used to drive incremental indexes such as {@link LagDetector#laggingIndex}.
+   *
+   * <p>Callers (e.g. {@link LagMitigationRebalancer}) invoke this once per job status at the start
+   * of each rebalancing cycle to prime any registered observers before querying them.
+   *
+   * @param jobId the job whose status is being replayed
+   * @param taskStatus the latest {@link KafkaConsumerTaskStatus} for the job
+   */
+  public void updateJobStatus(long jobId, KafkaConsumerTaskStatus taskStatus) {
+    for (JobStatusObserver observer : observers) {
+      observer.onStatusUpdate(this, jobId, taskStatus);
+    }
   }
 
   /**

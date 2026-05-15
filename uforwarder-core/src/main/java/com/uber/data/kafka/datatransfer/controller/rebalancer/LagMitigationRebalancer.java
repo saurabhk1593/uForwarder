@@ -9,6 +9,7 @@ import com.uber.data.kafka.datatransfer.JobType;
 import com.uber.data.kafka.datatransfer.KafkaConsumerTaskGroup;
 import com.uber.data.kafka.datatransfer.StoredJob;
 import com.uber.data.kafka.datatransfer.StoredJobGroup;
+import com.uber.data.kafka.datatransfer.StoredJobStatus;
 import com.uber.data.kafka.datatransfer.StoredWorker;
 import com.uber.data.kafka.datatransfer.common.StructuredLogging;
 import com.uber.data.kafka.datatransfer.controller.coordinator.LeaderSelector;
@@ -135,13 +136,28 @@ public class LagMitigationRebalancer implements Rebalancer {
     // slots count toward maxConcurrentCatchUpJobs correctly.
     cleanUpCompletedCatchUpGroups(jobGroups);
 
-    // Step 2: Detect lagging partitions.
+    // Step 2: Prime the LagDetector's index for this cycle via the Observer pattern.
+    // RebalancingJobGroup instances are ephemeral (recreated each cycle), so we register
+    // the detector, replay all current statuses, then immediately unregister to keep the
+    // observer list clean. onStatusUpdate() builds the laggingIndex in O(1) per job.
+    lagDetector.resetIndex();
+    for (RebalancingJobGroup group : jobGroups.values()) {
+      group.addObserver(lagDetector);
+      for (Map.Entry<Long, StoredJobStatus> entry : group.getJobStatusMap().entrySet()) {
+        group.updateJobStatus(
+            entry.getKey(),
+            entry.getValue().getJobStatus().getKafkaConsumerTaskStatus());
+      }
+      group.removeObserver(lagDetector);
+    }
+
+    // Step 3: Detect lagging partitions — reads laggingIndex, O(L).
     List<LagMitigationEvent> lagEvents = lagDetector.detect(jobGroups);
     if (lagEvents.isEmpty()) {
       return;
     }
 
-    // Step 3: Apply lag mitigation up to the configured concurrency limit.
+    // Step 4: Apply lag mitigation up to the configured concurrency limit.
     int activeCatchUpCount = activeCatchUpGroupIds.size();
     for (LagMitigationEvent event : lagEvents) {
       if (activeCatchUpCount >= config.getMaxConcurrentCatchUpJobs()) {
